@@ -1,0 +1,17 @@
+name: ci
+on:
+  push:
+  pull_request:
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm --prefix server install --no-audit --no-fund || npm --prefix server install
+      - run: node --check server/src/index.js && node --check server/src/scraper/index.js
+      - run: npm --prefix server test
+      - run: npm --prefix client install --no-audit --no-fund || npm --prefix client install
+      - run: npm --prefix client run build

@@ -1,0 +1,29 @@
+{
+  "name": "ine-price-tracker-server",
+  "version": "1.0.0",
+  "private": true,
+  "type": "commonjs",
+  "description": "INE Product Price Tracker backend (JavaScript, Express)",
+  "main": "src/index.js",
+  "scripts": {
+    "dev": "node src/index.js",
+    "start": "node src/index.js",
+    "build": "echo \"no build step (plain JS)\"",
+    "lint": "node --check src/index.js && echo lint-ok",
+    "test": "node --test tests/",
+    "scrape:headed": "node src/headed.js"
+  },
+  "dependencies": {
+    "axios": "^1.7.7",
+    "cheerio": "^1.0.0",
+    "cors": "^2.8.5",
+    "csv-stringify": "^6.5.1",
+    "dotenv": "^16.4.5",
+    "express": "^4.21.1",
+    "pg": "^8.13.0",
+    "pino": "^9.5.0",
+    "playwright": "^1.47.2",
+    "uuid": "^10.0.0",
+    "zod": "^3.23.8"
+  }
+}
