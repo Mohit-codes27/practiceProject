@@ -50,23 +50,25 @@ and interviewers can see the flakes.
 
 Render free tier sleeps; an in-process timer dies with the dyno and can double-
 fire across instances. An external cron POSTing to a secret-protected endpoint
-survives sleep. Overlap is guarded atomically: a SINGLE `INSERT ... SELECT
-WHERE NOT EXISTS (open run)` statement claims the run, so two simultaneous
-crons cannot both start one (a SELECT-then-INSERT would race). A Postgres
-advisory lock was considered but rejected: with a pooled driver the lock must
-be held on one connection for the whole run, while the single-statement claim
-is atomic by itself. Production refuses to boot without a long CRON_SECRET
-(fail-fast instead of fail-open). Per-product `scrape_interval_minutes`
-(default 120) lets one 2-hour cron serve products with different frequencies
-via due-checks.
+survives sleep. Overlap is guarded by a Postgres advisory lock
+(`pg_try_advisory_lock`) held on one dedicated connection for the whole run:
+a second concurrent cron gets `locked=false` immediately and returns "skipped".
+Note an earlier design used a single `INSERT ... SELECT WHERE NOT EXISTS`
+statement — that is NOT sufficient, because under MVCC two concurrent
+transactions can both snapshot "no open run" and both insert. `scrape_runs`
+rows remain as audit history, not as the lock. Production refuses to boot
+without a long CRON_SECRET (fail-fast instead of fail-open). Per-product
+`scrape_interval_minutes` (default 120) lets one 2-hour cron serve products
+with different frequencies via due-checks.
 
 ## Persistence — one transaction per finished scrape
 
 `db.saveScrapeOutcome()` writes attempts + optional history + tracking touch +
-events in a single Postgres transaction (single synchronous block in the
-in-memory backend): all commit together or all roll back. A crash between
-"history inserted" and "attempts inserted" can never leave half a scrape
-behind.
+events + structure fingerprint in a single Postgres transaction (single
+synchronous block in the in-memory backend): all commit together or all roll
+back. A crash between "history inserted" and "attempts inserted" — or a
+fingerprint advancing while its scrape's history is lost — can never leave
+half a scrape behind.
 
 ## Trade-offs
 

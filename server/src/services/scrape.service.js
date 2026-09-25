@@ -24,15 +24,15 @@ async function runSingle(trackedId, db, { headed = false, io = {} } = {}) {
     // STRUCTURE_CHANGED: manifest fingerprint differs from the last stored
     // one. Logged as an event — validation (not the fingerprint) decides
     // whether extraction still works, so this never fails a scrape.
-    if (result.manifestFp) {
-      if (prevFp && prevFp !== result.manifestFp) {
-        events.push({
-          eventType: 'STRUCTURE_CHANGED',
-          message: `Store layout fingerprint changed (${prevFp} -> ${result.manifestFp}). Extraction still validated.`,
-          metadata: { previous: prevFp, current: result.manifestFp },
-        });
-      }
-      await db.setStructureFingerprint(trackedId, result.manifestFp).catch(() => {});
+    // The new fingerprint is persisted INSIDE saveScrapeOutcome's transaction,
+    // never before it: otherwise a tx failure could advance the fingerprint
+    // while losing the scrape's history, silently swallowing the event.
+    if (result.manifestFp && prevFp && prevFp !== result.manifestFp) {
+      events.push({
+        eventType: 'STRUCTURE_CHANGED',
+        message: `Store layout fingerprint changed (${prevFp} -> ${result.manifestFp}). Extraction still validated.`,
+        metadata: { previous: prevFp, current: result.manifestFp },
+      });
     }
     await db.saveScrapeOutcome({
       trackedId,
@@ -40,6 +40,7 @@ async function runSingle(trackedId, db, { headed = false, io = {} } = {}) {
       history: { trackedProductId: trackedId, price: result.data.price, stock: result.data.stock, scrapedAt: new Date().toISOString() },
       success: true,
       events,
+      fingerprint: result.manifestFp || null,
     });
     return { success: true, data: result.data, attempts: result.attempts.length };
   }

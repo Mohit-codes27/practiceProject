@@ -118,3 +118,17 @@ test('PRICE_DROP fires when price falls', async () => {
   assert.equal(drops.length, 1);
   assert.deepEqual({ from: drops[0].metadata.from, to: drops[0].metadata.to }, { from: 70000, to: 69000 });
 });
+
+test('cron lock excludes overlapping runs', async () => {
+  const db = await getDb();
+  let releaseFirst;
+  const first = db.withCronLock(() => new Promise((res) => { releaseFirst = res; }));
+  await new Promise((r) => setTimeout(r, 20)); // let the first holder acquire
+  const second = await db.withCronLock(async () => 'second');
+  assert.equal(second.acquired, false); // overlapping run refused
+  releaseFirst('first');
+  assert.equal((await first).acquired, true);
+  const third = await db.withCronLock(async () => 'third');
+  assert.equal(third.acquired, true); // lock released after first finished
+  assert.equal(third.result, 'third');
+});

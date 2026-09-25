@@ -12,6 +12,10 @@ function nowIso() {
   return new Date().toISOString();
 }
 
+// Advisory-lock key for the cron guard (arbitrary 64-bit id, namespaced to
+// this app so it can never collide with another app's locks on shared Pg).
+const CRON_LOCK_KEY = 910271845;
+
 // ---------------- In-memory fallback ----------------
 function createMemoryDb() {
   const state = {
@@ -25,6 +29,11 @@ function createMemoryDb() {
     runs: [],
     fingerprints: new Map(),  // trackedProductId -> structure fingerprint
   };
+
+  // Cron overlap flag. Node is single-threaded and the check-and-set below
+  // has no await between test and set, so it is race-free here (unlike the
+  // old pg SELECT-then-INSERT, which could race across connections).
+  let cronLocked = false;
 
   return {
     kind: 'memory',
@@ -136,10 +145,11 @@ function createMemoryDb() {
     },
     // -- atomic persistence of one finished scrape --
     // One synchronous mutation block: attempts + optional history + tracking
-    // touch + events land together, so a mid-save crash can't leave partial
-    // state (e.g. history without attempts). Single-threaded JS makes this
-    // atomic here; the pg backend below uses a real transaction.
-    async saveScrapeOutcome({ trackedId, attempts, history, success, events }) {
+    // touch + events + fingerprint land together, so a mid-save crash can't
+    // leave partial state (e.g. history without attempts, or a fingerprint
+    // updated while its scrape's history was lost). Single-threaded JS makes
+    // this atomic here; the pg backend below uses a real transaction.
+    async saveScrapeOutcome({ trackedId, attempts, history, success, events, fingerprint }) {
       for (const a of attempts || []) state.attempts.push({ id: randomUUID(), createdAt: nowIso(), ...a });
       if (history) state.history.push({ id: randomUUID(), ...history });
       const t = state.tracked.get(trackedId);
@@ -149,8 +159,19 @@ function createMemoryDb() {
         t.updatedAt = nowIso();
       }
       for (const e of events || []) state.events.push({ id: randomUUID(), createdAt: nowIso(), trackedProductId: trackedId, ...e });
+      if (fingerprint) state.fingerprints.set(trackedId, fingerprint);
     },
     // -- runs (overlap lock) --
+    // Memory backend is single-threaded: synchronous check-and-set, no race.
+    async withCronLock(fn) {
+      if (cronLocked) return { acquired: false };
+      cronLocked = true;
+      try {
+        return { acquired: true, result: await fn() };
+      } finally {
+        cronLocked = false;
+      }
+    },
     async tryStartRun(trigger) {
       const open = state.runs.find((r) => !r.completedAt);
       if (open && Date.now() - new Date(open.startedAt).getTime() < 15 * 60 * 1000) return null;
@@ -293,8 +314,10 @@ function createPgDb(pgPool) {
         ON CONFLICT (tracked_product_id) DO UPDATE SET fingerprint=EXCLUDED.fingerprint, updated_at=now()`, [trackedId, fp]);
     },
     // Atomic persistence: attempts + optional history + tracking touch +
-    // events commit together or roll back together — never partial state.
-    async saveScrapeOutcome({ trackedId, attempts, history, success, events }) {
+    // events + fingerprint commit together or roll back together — never
+    // partial state (in particular the fingerprint can never advance while
+    // its scrape's history is lost).
+    async saveScrapeOutcome({ trackedId, attempts, history, success, events, fingerprint }) {
       await tx(async (xq) => {
         for (const a of attempts || []) {
           await xq(`INSERT INTO scrape_attempts (tracked_product_id,attempt_number,status,strategy,started_at,completed_at,duration_ms,price,stock,http_status,error_code,error_message)
@@ -312,17 +335,39 @@ function createPgDb(pgPool) {
           await xq('INSERT INTO scraper_events (tracked_product_id,event_type,message,metadata) VALUES ($1,$2,$3,$4)',
             [trackedId, e.eventType, e.message, e.metadata ? JSON.stringify(e.metadata) : null]);
         }
+        if (fingerprint) {
+          await xq(`INSERT INTO structure_fingerprints (tracked_product_id,fingerprint) VALUES ($1,$2)
+            ON CONFLICT (tracked_product_id) DO UPDATE SET fingerprint=EXCLUDED.fingerprint, updated_at=now()`,
+            [trackedId, fingerprint]);
+        }
       });
     },
+    // True mutual exclusion via a Postgres advisory lock held on ONE dedicated
+    // connection for the whole run. pg_try_advisory_lock returns false
+    // immediately if another backend holds it — no waiting, no race. The lock
+    // is session-scoped, so it auto-releases if the process/connection dies
+    // (then the next cron simply starts cleanly). Holding 1 of 10 pooled
+    // connections for a few minutes every 2h is negligible.
+    // (A plain INSERT...SELECT WHERE NOT EXISTS is NOT enough: under MVCC two
+    // concurrent transactions can both snapshot "no open run" and both insert.)
+    async withCronLock(fn) {
+      const client = await pgPool.connect();
+      try {
+        const r = await client.query('SELECT pg_try_advisory_lock($1) AS locked', [CRON_LOCK_KEY]);
+        if (!r.rows[0].locked) return { acquired: false };
+        try {
+          return { acquired: true, result: await fn() };
+        } finally {
+          await client.query('SELECT pg_advisory_unlock($1)', [CRON_LOCK_KEY]).catch(() => {});
+        }
+      } finally {
+        client.release();
+      }
+    },
     async tryStartRun(trigger) {
-      // SINGLE statement => atomic. The old SELECT-then-INSERT had a race:
-      // two concurrent crons could both see "no open run" and both start.
-      // Here Postgres evaluates the guard and the insert together, so at most
-      // one of two simultaneous requests gets a row back.
-      const r = await q(`INSERT INTO scrape_runs (trigger)
-        SELECT $1 WHERE NOT EXISTS (
-          SELECT 1 FROM scrape_runs WHERE completed_at IS NULL AND started_at > now() - interval '15 minutes'
-        ) RETURNING *`, [trigger]);
+      // Audit row only — the real mutual exclusion is withCronLock above.
+      // Kept as a plain insert; concurrent inserts here are harmless history.
+      const r = await q(`INSERT INTO scrape_runs (trigger) VALUES ($1) RETURNING *`, [trigger]);
       return r.rows[0] || null;
     },
     async finishRun(id, status) {

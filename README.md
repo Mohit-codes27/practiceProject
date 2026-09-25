@@ -20,9 +20,9 @@ Users search the mock store, pick a product + option (storage/kit/pack), track i
   live manifest; stable app hooks + button-text matching for the rest)
 - 3 attempts with exponential backoff + error classification
 - `scrape_attempts` (every attempt) vs `price_history` (validated successes only)
-- Atomic scrape persistence (single transaction: attempts + history + touch + events)
-- Protected `POST /api/cron/scrape` for cron-job.org, overlap-guarded by an
-  atomic single-statement run claim (fails closed without `CRON_SECRET` in prod)
+- Atomic scrape persistence (single transaction: attempts + history + touch + events + fingerprint)
+- Protected `POST /api/cron/scrape` for cron-job.org, overlap-guarded by a
+  held Postgres advisory lock (fails closed without `CRON_SECRET` in prod)
 - CSV export of all attempts (failures with blank price/stock, ISO-8601 UTC)
 - Headed mode: `npm run scrape:headed -- --tracked=<id>`
 - Bonus: PRICE_DROP / BACK_IN_STOCK / STRUCTURE_CHANGED events, per-product frequency (`scrape_interval_minutes`), CI
@@ -150,7 +150,7 @@ headed scrape.
 - Manifest-driven selectors via `buildSelectors()` + STRUCTURE_CHANGED events (fingerprint persisted per product, compared every scrape).
 - Never `price || 0`; unknown stock stays unknown; history only on validated success.
 - Atomic persistence (one transaction per finished scrape, pg) — no partial state.
-- Concurrency 2, per-product due-check, atomic single-statement cron run claim.
+- Concurrency 2, per-product due-check, advisory-lock cron overlap guard.
 
 ## Bonus Features
 
