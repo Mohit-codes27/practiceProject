@@ -1,6 +1,9 @@
 'use strict';
 
-require('dotenv').config();
+try {
+  // eslint-disable-next-line global-require
+  require('dotenv').config();
+} catch { /* dotenv optional for tests */ }
 
 function num(name, fallback) {
   const v = Number(process.env[name]);

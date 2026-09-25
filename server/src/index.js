@@ -10,6 +10,15 @@ const api = require('./routes/api');
 const cron = require('./routes/cron');
 const logger = require('./utils/logger');
 
+// Fail fast in production: deploying without CRON_SECRET would leave the
+// cron endpoint unprotected (or 503 forever). Refuse to boot instead.
+if (env.NODE_ENV === 'production' && !env.CRON_SECRET) {
+  throw new Error('CRON_SECRET is required in production. Set it to a long random string.');
+}
+if (env.NODE_ENV === 'production' && env.CRON_SECRET.length < 16) {
+  throw new Error('CRON_SECRET must be at least 16 characters in production.');
+}
+
 const app = express();
 app.use(cors({ origin: env.NODE_ENV === 'production' ? env.FRONTEND_URL : true }));
 app.use(express.json({ limit: '256kb' }));

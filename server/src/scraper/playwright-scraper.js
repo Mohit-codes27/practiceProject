@@ -1,18 +1,20 @@
 'use strict';
 
-// Playwright fallback: the ONLY way to unlock price/stock on this store.
+// Playwright extraction for the browser-gated price/stock quote.
 // Flow mirrors what a real user does:
 //   1. open /item/:id, dismiss random consent dialog (up to 3 clicks)
 //   2. click the tracked option chip (exact label match — never first price)
 //   3. hover the locked price panel (>=8 moves, real mouse) to satisfy dwell check
-//   4. click "Check today's price", wait for .offer-ready (retries inside page too)
+//   4. click "Check today's price", wait for the unlocked panel
 //   5. extract ONLY the visible price node (ignore display:none decoys),
 //      parse with parser.js, validate, return.
-// Browser is always closed in `finally` — no orphaned processes.
+// All selectors come from buildSelectors(manifest): rotating classes from the
+// live manifest, stable app hooks from STABLE_SELECTORS, text matching for the
+// unlock button. Browser is always closed in `finally` — no orphaned processes.
 
 const { env } = require('../config/env');
 const { parsePrice, parseStock, matchOption } = require('./parser');
-const logger = require('../utils/logger');
+const { buildSelectors } = require('./selectors');
 
 let playwright = null;
 function pw() {
@@ -20,9 +22,9 @@ function pw() {
   return playwright;
 }
 
-async function dismissConsent(page) {
+async function dismissConsent(page, sel) {
   for (let i = 0; i < 4; i++) {
-    const box = page.locator('.consent-box');
+    const box = page.locator(sel.consentBox);
     if ((await box.count()) === 0) return;
     const btn = box.locator('button').first();
     if ((await btn.count()) === 0) return;
@@ -35,6 +37,7 @@ async function dismissConsent(page) {
 async function scrapeWithPlaywright({ storeProductId, optionLabel, sourceUrl, headed, timeoutMs, manifest }) {
   const started = Date.now();
   const strategy = 'playwright';
+  const sel = buildSelectors(manifest);
   const browser = await pw().chromium.launch({ headless: headed === true ? false : env.HEADLESS });
   try {
     const page = await browser.newPage({ viewport: { width: 1366, height: 900 } });
@@ -45,17 +48,17 @@ async function scrapeWithPlaywright({ storeProductId, optionLabel, sourceUrl, he
       throw Object.assign(new Error(`Navigation timeout for ${sourceUrl}`), { code: 'NAV_TIMEOUT' });
     }
 
-    await dismissConsent(page).catch((e) => { throw e; });
-    await page.waitForSelector('.pdp-summary, .offer-panel', { timeout: 15000 }).catch(() => {
+    await dismissConsent(page, sel).catch((e) => { throw e; });
+    await page.waitForSelector(sel.productReady, { timeout: 15000 }).catch(() => {
       throw Object.assign(new Error('Product page never rendered (store flake).'), { code: 'STORE_FLAKY_DROP' });
     });
 
     // 1. product identity from the rendered page
-    const productName = (await page.locator('.pdp-summary h1').first().textContent().catch(() => '')).trim();
+    const productName = (await page.locator(sel.summaryTitle).first().textContent().catch(() => '')).trim();
     if (!productName) throw Object.assign(new Error('Product name not rendered.'), { code: 'PRICE_NOT_FOUND' });
 
     // 2. select the EXACT tracked option (never the default highlighted chip)
-    const chips = page.locator('.opt-chip');
+    const chips = page.locator(sel.optionChip);
     const n = await chips.count();
     if (n > 1) {
       let clicked = null;
@@ -72,7 +75,7 @@ async function scrapeWithPlaywright({ storeProductId, optionLabel, sourceUrl, he
     }
 
     // 3. hover the locked panel with a real mouse (>=8 moves over the panel)
-    const panel = page.locator('.offer-panel');
+    const panel = page.locator(sel.panel);
     const box = await panel.first().boundingBox().catch(() => null);
     if (box) {
       const cx = box.x + box.width / 2, cy = box.y + box.height / 2;
@@ -83,30 +86,29 @@ async function scrapeWithPlaywright({ storeProductId, optionLabel, sourceUrl, he
     }
     await page.waitForTimeout(700); // dwell >= 600ms
 
-    // 4. click unlock; the page itself retries up to 6 times internally
-    const checkBtn = page.locator('.offer-panel button.ctl-main, .offer-panel button:has-text("Check")').first();
+    // 4. click unlock (selector first, button-text fallback); the page itself
+    //    retries the quote request up to 6 times internally
+    const checkBtn = page.locator(`${sel.unlockButton}, ${sel.panel} button:has-text("${sel.unlockButtonText}")`).first();
     await checkBtn.click({ timeout: 8000 }).catch(() => {
       throw Object.assign(new Error('Price unlock button never became clickable.'), { code: 'EXTRACT_TIMEOUT' });
     });
 
-    await page.waitForSelector('.offer-ready', { timeout: env.BROWSER_TIMEOUT_MS }).catch(async () => {
-      const failed = await page.locator('.offer-failed').count();
-      const msg = failed ? (await page.locator('.offer-failed').first().textContent()) : 'price panel never unlocked';
+    await page.waitForSelector(sel.ready, { timeout: env.BROWSER_TIMEOUT_MS }).catch(async () => {
+      const failed = await page.locator(sel.failed).count();
+      const msg = failed ? (await page.locator(sel.failed).first().textContent()) : 'price panel never unlocked';
       const err = new Error(String(msg).slice(0, 300));
       err.code = 'CHALLENGE_FAILED';
       throw err;
     });
 
-    // 5. extract the VISIBLE price.
-    // The store rotates layout (see /api/v2/ui/manifest): right now it uses
-    // priceCarrier "split" — the real price node contains one <span> per
-    // CHARACTER, so "biggest single node" heuristics return one digit.
-    // Fix: prefer the manifest's priceValue node (its textContent is the FULL
-    // price in both plain and split modes), fall back to the visible node with
-    // the LONGEST digit run (a split char has 1 digit; the true price has 4+).
-    // display:none decoys, line-through MRP and "Member price" text are excluded.
-    const priceText = await page.evaluate((manifest) => {
-      const row = document.querySelector('.offer-row');
+    // 5. extract the VISIBLE price. The store rotates layout: with priceCarrier
+    //    "split" the price node holds one <span> per CHARACTER, so single-node
+    //    heuristics return one digit. Fix: prefer the manifest's priceValue
+    //    node (full text in both modes); fall back to the visible node with
+    //    the LONGEST digit run. display:none decoys, line-through MRP and
+    //    "Member price" text are excluded.
+    const priceText = await page.evaluate((s) => {
+      const row = document.querySelector(s.row);
       if (!row) return '';
       const shown = (el) => {
         const st = window.getComputedStyle(el);
@@ -114,9 +116,8 @@ async function scrapeWithPlaywright({ storeProductId, optionLabel, sourceUrl, he
         if (el.style.display === 'none') return false;
         return true;
       };
-      const cls = manifest && manifest.classes && manifest.classes.priceValue;
-      if (cls) {
-        const el = row.querySelector('.' + cls);
+      if (s.priceValue) {
+        const el = row.querySelector(s.priceValue);
         if (el && shown(el)) {
           const t = (el.textContent || '').trim();
           if (/\d/.test(t)) return t;
@@ -136,12 +137,12 @@ async function scrapeWithPlaywright({ storeProductId, optionLabel, sourceUrl, he
         if (digits > bestDigits) { bestDigits = digits; best = t; }
       }
       return best;
-    }, manifest || null);
+    }, { row: sel.row, priceValue: sel.priceValue });
 
-    const stockText = await page.evaluate(() => {
-      const el = document.querySelector('.offer-facts, .offer-ready');
+    const stockText = await page.evaluate((s) => {
+      const el = document.querySelector(`${s.facts}, ${s.ready}`);
       return el ? el.textContent || '' : '';
-    });
+    }, { facts: sel.facts, ready: sel.ready });
 
     const price = parsePrice(priceText);
     if (!price.ok) {

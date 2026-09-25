@@ -23,6 +23,7 @@ function createMemoryDb() {
     attempts: [],               // scrape_attempts rows
     events: [],
     runs: [],
+    fingerprints: new Map(),  // trackedProductId -> structure fingerprint
   };
 
   return {
@@ -126,6 +127,29 @@ function createMemoryDb() {
       const h = state.history.filter((x) => x.trackedProductId === trackedId).sort((a, b) => (a.scrapedAt < b.scrapedAt ? 1 : -1));
       return h[0] || null;
     },
+    // -- structure fingerprints (STRUCTURE_CHANGED bonus) --
+    async getStructureFingerprint(trackedId) {
+      return state.fingerprints.get(trackedId) || null;
+    },
+    async setStructureFingerprint(trackedId, fp) {
+      state.fingerprints.set(trackedId, fp);
+    },
+    // -- atomic persistence of one finished scrape --
+    // One synchronous mutation block: attempts + optional history + tracking
+    // touch + events land together, so a mid-save crash can't leave partial
+    // state (e.g. history without attempts). Single-threaded JS makes this
+    // atomic here; the pg backend below uses a real transaction.
+    async saveScrapeOutcome({ trackedId, attempts, history, success, events }) {
+      for (const a of attempts || []) state.attempts.push({ id: randomUUID(), createdAt: nowIso(), ...a });
+      if (history) state.history.push({ id: randomUUID(), ...history });
+      const t = state.tracked.get(trackedId);
+      if (t) {
+        t.lastScrapedAt = nowIso();
+        if (success) t.lastSuccessAt = t.lastScrapedAt;
+        t.updatedAt = nowIso();
+      }
+      for (const e of events || []) state.events.push({ id: randomUUID(), createdAt: nowIso(), trackedProductId: trackedId, ...e });
+    },
     // -- runs (overlap lock) --
     async tryStartRun(trigger) {
       const open = state.runs.find((r) => !r.completedAt);
@@ -150,6 +174,24 @@ function enrichTracked(state, t) {
 // ---------------- Postgres (Supabase) ----------------
 function createPgDb(pgPool) {
   const q = (text, params) => pgPool.query(text, params);
+  // Run fn(query) inside a real transaction on ONE dedicated connection.
+  // (Advisory locks would also need a held connection; a transaction is the
+  // simplest correct primitive here and keeps attempts+history+touch+events
+  // atomic: all commit together or all roll back.)
+  async function tx(fn) {
+    const client = await pgPool.connect();
+    try {
+      await client.query('BEGIN');
+      const out = await fn(client.query.bind(client));
+      await client.query('COMMIT');
+      return out;
+    } catch (err) {
+      await client.query('ROLLBACK').catch(() => {});
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
   return {
     kind: 'pg',
     async init() {
@@ -160,7 +202,8 @@ function createPgDb(pgPool) {
         CREATE TABLE IF NOT EXISTS price_history (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), tracked_product_id UUID NOT NULL REFERENCES tracked_products(id) ON DELETE CASCADE, price NUMERIC NOT NULL, stock BOOLEAN NOT NULL, scraped_at TIMESTAMPTZ NOT NULL DEFAULT now());
         CREATE TABLE IF NOT EXISTS scrape_attempts (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), tracked_product_id UUID NOT NULL REFERENCES tracked_products(id) ON DELETE CASCADE, attempt_number INTEGER NOT NULL, status TEXT NOT NULL, strategy TEXT NOT NULL, started_at TIMESTAMPTZ NOT NULL DEFAULT now(), completed_at TIMESTAMPTZ, duration_ms INTEGER, price NUMERIC, stock BOOLEAN, http_status INTEGER, error_code TEXT, error_message TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT now());
         CREATE TABLE IF NOT EXISTS scraper_events (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), tracked_product_id UUID REFERENCES tracked_products(id) ON DELETE CASCADE, event_type TEXT NOT NULL, message TEXT NOT NULL, metadata JSONB, created_at TIMESTAMPTZ NOT NULL DEFAULT now());
-        CREATE TABLE IF NOT EXISTS scrape_runs (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), started_at TIMESTAMPTZ NOT NULL DEFAULT now(), completed_at TIMESTAMPTZ, status TEXT NOT NULL DEFAULT 'running', trigger TEXT);`);
+        CREATE TABLE IF NOT EXISTS scrape_runs (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), started_at TIMESTAMPTZ NOT NULL DEFAULT now(), completed_at TIMESTAMPTZ, status TEXT NOT NULL DEFAULT 'running', trigger TEXT);
+        CREATE TABLE IF NOT EXISTS structure_fingerprints (tracked_product_id UUID PRIMARY KEY REFERENCES tracked_products(id) ON DELETE CASCADE, fingerprint TEXT NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT now());`);
       logger.info('db postgres ready');
     },
     async close() { await pgPool.end(); },
@@ -241,11 +284,46 @@ function createPgDb(pgPool) {
       const r = await q('SELECT * FROM price_history WHERE tracked_product_id=$1 ORDER BY scraped_at DESC LIMIT 1', [trackedId]);
       return r.rows[0] || null;
     },
+    async getStructureFingerprint(trackedId) {
+      const r = await q('SELECT fingerprint FROM structure_fingerprints WHERE tracked_product_id=$1', [trackedId]);
+      return r.rows[0] ? r.rows[0].fingerprint : null;
+    },
+    async setStructureFingerprint(trackedId, fp) {
+      await q(`INSERT INTO structure_fingerprints (tracked_product_id,fingerprint) VALUES ($1,$2)
+        ON CONFLICT (tracked_product_id) DO UPDATE SET fingerprint=EXCLUDED.fingerprint, updated_at=now()`, [trackedId, fp]);
+    },
+    // Atomic persistence: attempts + optional history + tracking touch +
+    // events commit together or roll back together — never partial state.
+    async saveScrapeOutcome({ trackedId, attempts, history, success, events }) {
+      await tx(async (xq) => {
+        for (const a of attempts || []) {
+          await xq(`INSERT INTO scrape_attempts (tracked_product_id,attempt_number,status,strategy,started_at,completed_at,duration_ms,price,stock,http_status,error_code,error_message)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+            [trackedId, a.attemptNumber, a.status, a.strategy, a.startedAt, a.completedAt || null, a.durationMs ?? null, a.price ?? null, a.stock ?? null, a.httpStatus ?? null, a.errorCode || null, a.errorMessage || null]);
+        }
+        if (history) {
+          await xq('INSERT INTO price_history (tracked_product_id,price,stock,scraped_at) VALUES ($1,$2,$3,$4)',
+            [trackedId, history.price, history.stock, history.scrapedAt]);
+        }
+        await xq(success
+          ? 'UPDATE tracked_products SET last_scraped_at=now(), last_success_at=now(), updated_at=now() WHERE id=$1'
+          : 'UPDATE tracked_products SET last_scraped_at=now(), updated_at=now() WHERE id=$1', [trackedId]);
+        for (const e of events || []) {
+          await xq('INSERT INTO scraper_events (tracked_product_id,event_type,message,metadata) VALUES ($1,$2,$3,$4)',
+            [trackedId, e.eventType, e.message, e.metadata ? JSON.stringify(e.metadata) : null]);
+        }
+      });
+    },
     async tryStartRun(trigger) {
-      const open = await q("SELECT * FROM scrape_runs WHERE completed_at IS NULL AND started_at > now() - interval '15 minutes' LIMIT 1");
-      if (open.rows.length) return null;
-      const r = await q("INSERT INTO scrape_runs (trigger) VALUES ($1) RETURNING *", [trigger]);
-      return r.rows[0];
+      // SINGLE statement => atomic. The old SELECT-then-INSERT had a race:
+      // two concurrent crons could both see "no open run" and both start.
+      // Here Postgres evaluates the guard and the insert together, so at most
+      // one of two simultaneous requests gets a row back.
+      const r = await q(`INSERT INTO scrape_runs (trigger)
+        SELECT $1 WHERE NOT EXISTS (
+          SELECT 1 FROM scrape_runs WHERE completed_at IS NULL AND started_at > now() - interval '15 minutes'
+        ) RETURNING *`, [trigger]);
+      return r.rows[0] || null;
     },
     async finishRun(id, status) {
       await q('UPDATE scrape_runs SET completed_at=now(), status=$2 WHERE id=$1', [id, status]);

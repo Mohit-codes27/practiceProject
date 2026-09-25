@@ -20,6 +20,10 @@ function cronAuth(req, res, next) {
   const { env } = require('../config/env');
   // Allow empty CRON_SECRET in local dev only.
   if (!env.CRON_SECRET && env.NODE_ENV !== 'production') return next();
+  // Defense in depth: if production somehow boots without a secret (the
+  // startup check in index.js should already have refused), fail closed with
+  // 503 instead of comparing against `Bearer ` (empty secret must NEVER pass).
+  if (!env.CRON_SECRET) return fail(res, 503, 'CRON_MISCONFIGURED', 'Cron endpoint is not configured.');
   const header = req.headers.authorization || '';
   if (header === `Bearer ${env.CRON_SECRET}`) return next();
   return fail(res, 401, 'CRON_UNAUTHORIZED', 'Invalid cron secret.');

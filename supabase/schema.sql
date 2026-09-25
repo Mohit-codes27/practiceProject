@@ -82,3 +82,12 @@ create table if not exists scrape_runs (
   status text not null default 'running',
   trigger text
 );
+
+-- Last known store-layout fingerprint per tracked product. Compared on every
+-- scrape; a change emits a STRUCTURE_CHANGED event (extraction still decided
+-- by validation, never by the fingerprint alone).
+create table if not exists structure_fingerprints (
+  tracked_product_id uuid primary key references tracked_products(id) on delete cascade,
+  fingerprint text not null,
+  updated_at timestamptz not null default now()
+);

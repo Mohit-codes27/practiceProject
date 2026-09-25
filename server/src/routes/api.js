@@ -6,6 +6,7 @@ const { getDb } = require('../config/database');
 const { ok, fail } = require('../middleware/http');
 const productService = require('../services/product.service');
 const scrapeService = require('../services/scrape.service');
+const trackingService = require('../services/tracking.service');
 const { attemptsToCsv } = require('../utils/csv');
 
 const router = express.Router();
@@ -36,15 +37,12 @@ router.post('/tracked-products', async (req, res, next) => {
   try {
     const body = trackSchema.parse(req.body);
     const db = await getDb();
-    const withOpts = await db.getProductWithOptions(body.productId);
-    if (!withOpts) return fail(res, 404, 'PRODUCT_NOT_FOUND', 'Product not found. Open it from search first.');
-    const opt = (withOpts.options || []).find((o) => o.id === body.optionId);
-    if (!opt) return fail(res, 400, 'OPTION_NOT_FOUND', 'Option does not belong to this product.');
-    const { row, created } = await db.createTracked({ productId: withOpts.id, optionId: opt.id });
+    const { row, created } = await trackingService.trackProduct(body.productId, body.optionId, db);
     res.status(created ? 201 : 200);
     ok(res, row);
   } catch (e) {
     if (e instanceof z.ZodError) return fail(res, 400, 'VALIDATION_ERROR', e.errors.map((x) => x.message).join('; '));
+    if (e.status) return fail(res, e.status, e.code || 'TRACK_ERROR', e.message);
     next(e);
   }
 });
@@ -71,13 +69,18 @@ router.get('/tracked-products/:id', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
+const activeSchema = z.object({ active: z.boolean() });
 router.patch('/tracked-products/:id', async (req, res, next) => {
   try {
+    const { active } = activeSchema.parse(req.body); // strict boolean: "false" (string) is rejected, not coerced to true
     const db = await getDb();
-    const t = await db.setTrackedActive(req.params.id, req.body.active !== false);
+    const t = await db.setTrackedActive(req.params.id, active);
     if (!t) return fail(res, 404, 'TRACKED_NOT_FOUND', 'Tracked product not found.');
     ok(res, t);
-  } catch (e) { next(e); }
+  } catch (e) {
+    if (e instanceof z.ZodError) return fail(res, 400, 'VALIDATION_ERROR', e.errors.map((x) => x.message).join('; '));
+    next(e);
+  }
 });
 
 // --- History / logs ---

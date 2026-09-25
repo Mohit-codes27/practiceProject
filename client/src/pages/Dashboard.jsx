@@ -59,7 +59,13 @@ export function DetailsPage({ trackedId }) {
       : 'Scrape started… attempt 1: HTTP metadata → Playwright unlock…');
     try {
       const r = await scrape();
-      setMsg(r.success ? `Success ✓ — history updated.` : `Failed (${r.errorCode}): ${r.errorMessage || 'no details'} — see log table below.`);
+      if (r.success) {
+        setMsg(`Success ✓ — history updated.`);
+      } else if (first) {
+        setMsg(`Initial automatic scrape failed (${r.errorCode}): ${r.errorMessage || 'no details'}. The product stays tracked — scheduled runs will retry it automatically, or press Scrape Now to retry manually. Attempts are in the log table below; no fake history was stored.`);
+      } else {
+        setMsg(`Failed (${r.errorCode}): ${r.errorMessage || 'no details'} — see log table below.`);
+      }
     } catch (e) {
       setMsg(`Error: ${e.message}`);
     }

@@ -12,6 +12,9 @@ jobs:
           node-version: 20
       - run: npm --prefix server install --no-audit --no-fund || npm --prefix server install
       - run: node --check server/src/index.js && node --check server/src/scraper/index.js
+      # NOTE: unit + service tests use stubbed scraper I/O — no Chromium needed.
+      # They verify retry/history/event logic, NOT the live browser extraction;
+      # that is verified manually via the headed scrape before submission.
       - run: npm --prefix server test
       - run: npm --prefix client install --no-audit --no-fund || npm --prefix client install
       - run: npm --prefix client run build

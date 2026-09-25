@@ -1,15 +1,27 @@
 # Design Note
 
-## Scraping reliability — why HTTP first, Playwright second
+## Scraping reliability — HTTP-first metadata, Playwright for gated quotes
 
 The store is a React SPA: `GET /` returns an empty `<div id="root">`. No price
 exists in HTML, so Cheerio selectors can never work for price — we proved this
-with `probeProductPageHtml` instead of assuming it. HTTP (axios) handles
-catalog (`/api/v2/listings`), item details (`/api/v2/items/:id`) and the UI
-manifest (`/api/v2/ui/manifest`): fast, cheap, no browser. But price/stock are
-gated behind hover-dwell tracking, a proof-of-work + WASM challenge and an
-encrypted quote response that only a real browser session can complete, so
-Playwright is the genuine fallback — used only where HTTP provably cannot work.
+with `probeProductPageHtml` instead of assuming it. To be precise about the
+architecture: HTTP (axios) handles metadata acquisition — catalog
+(`/api/v2/listings`), item details (`/api/v2/items/:id`) and the UI manifest
+(`/api/v2/ui/manifest`): fast, cheap, no browser. But price/stock are gated
+behind hover-dwell tracking, a proof-of-work + WASM challenge and an encrypted
+quote response that only a real browser session can complete, so Playwright
+performs the actual price/stock extraction. We do NOT attempt HTTP price
+extraction first — the quote endpoint requires a live browser session, so that
+would fail by design. The honest description is "HTTP-first metadata +
+Playwright for browser-gated extraction", not "HTTP scraper with fallback".
+
+Selectors: everything the manifest rotates (priceValue, mrp, sale, badge, …)
+is read via `buildSelectors(manifest)` at scrape time (`server/src/scraper/
+selectors.js`); stable app hooks (`.offer-panel`, `.opt-chip`, consent dialog)
+and button-text matching cover the rest. Each scrape also fingerprints the
+manifest into `structure_fingerprints`; a change emits STRUCTURE_CHANGED (and
+is covered by a service test) without ever failing the scrape — validation,
+not the fingerprint, decides success.
 
 ## Retries — why 3 attempts with exponential backoff + jitter
 
@@ -38,9 +50,23 @@ and interviewers can see the flakes.
 
 Render free tier sleeps; an in-process timer dies with the dyno and can double-
 fire across instances. An external cron POSTing to a secret-protected endpoint
-survives sleep. Overlap is guarded by `scrape_runs` (a new run refuses to start
-if one is active <15 min). Per-product `scrape_interval_minutes` (default 120)
-lets one 2-hour cron serve products with different frequencies via due-checks.
+survives sleep. Overlap is guarded atomically: a SINGLE `INSERT ... SELECT
+WHERE NOT EXISTS (open run)` statement claims the run, so two simultaneous
+crons cannot both start one (a SELECT-then-INSERT would race). A Postgres
+advisory lock was considered but rejected: with a pooled driver the lock must
+be held on one connection for the whole run, while the single-statement claim
+is atomic by itself. Production refuses to boot without a long CRON_SECRET
+(fail-fast instead of fail-open). Per-product `scrape_interval_minutes`
+(default 120) lets one 2-hour cron serve products with different frequencies
+via due-checks.
+
+## Persistence — one transaction per finished scrape
+
+`db.saveScrapeOutcome()` writes attempts + optional history + tracking touch +
+events in a single Postgres transaction (single synchronous block in the
+in-memory backend): all commit together or all roll back. A crash between
+"history inserted" and "attempts inserted" can never leave half a scrape
+behind.
 
 ## Trade-offs
 

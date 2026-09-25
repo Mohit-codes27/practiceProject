@@ -12,10 +12,17 @@ Users search the mock store, pick a product + option (storage/kit/pack), track i
 
 - Partial/full-name product search (paged listings API + in-memory filter)
 - Option/variant selection (exact-match — never "first price on page")
-- HTTP-first scraper, Playwright fallback for the JS-gated price panel
+- HTTP-first metadata acquisition + manifest lookup, with Playwright performing
+  the browser-gated price/stock extraction (the quote endpoint requires a live
+  browser session, so HTTP price extraction is not attempted — see
+  `docs/design-note.md`)
+- Manifest-driven selectors via `buildSelectors()` (rotating classes from the
+  live manifest; stable app hooks + button-text matching for the rest)
 - 3 attempts with exponential backoff + error classification
 - `scrape_attempts` (every attempt) vs `price_history` (validated successes only)
-- Protected `POST /api/cron/scrape` for cron-job.org, overlap-guarded via `scrape_runs`
+- Atomic scrape persistence (single transaction: attempts + history + touch + events)
+- Protected `POST /api/cron/scrape` for cron-job.org, overlap-guarded by an
+  atomic single-statement run claim (fails closed without `CRON_SECRET` in prod)
 - CSV export of all attempts (failures with blank price/stock, ISO-8601 UTC)
 - Headed mode: `npm run scrape:headed -- --tracked=<id>`
 - Bonus: PRICE_DROP / BACK_IN_STOCK / STRUCTURE_CHANGED events, per-product frequency (`scrape_interval_minutes`), CI
@@ -92,7 +99,7 @@ Opens a visible browser: consent dialog → option chip → hover dwell → "Che
 | POST | `/api/tracked-products` | `{ productId, optionId }` (Zod) |
 | GET | `/api/tracked-products` | list with product/option |
 | GET | `/api/tracked-products/:id` | one |
-| PATCH | `/api/tracked-products/:id` | `{ active }` |
+| PATCH | `/api/tracked-products/:id` | `{ active: boolean }` (strict Zod boolean) |
 | GET | `/api/tracked-products/:id/history?limit=` | successful history |
 | GET | `/api/tracked-products/:id/logs?limit=` | every attempt, newest first |
 | POST | `/api/tracked-products/:id/scrape` | manual scrape (same service) |
@@ -127,17 +134,23 @@ Errors: `{ success: false, error: { code, message } }` (no stack traces in prod)
 ## Testing
 
 ```bash
-npm --prefix server test   # node:test unit tests: parser, stock, options, retry, CSV
+npm --prefix server test   # node:test — parser/stock/options/retry/CSV unit tests
+                           # + service tests: tracking validation, duplicates,
+                           # failed scrape (3 attempts/0 history), success,
+                           # retry-then-success, STRUCTURE_CHANGED, PRICE_DROP
 ```
 
-Parser tests use saved fixtures reasoning, not live pages (no flaky external deps).
+Unit tests use stubbed scraper I/O (no live pages, no browser needed — CI does
+not install Playwright browsers). The live store is verified manually via the
+headed scrape.
 
 ## Reliability Decisions
 
-- SPA store ⇒ HTTP gets metadata, Playwright unlocks price (proven by HTML probe, not assumed).
-- Manifest-driven selectors (class names rotate) + STRUCTURE_CHANGED events.
+- SPA store ⇒ HTTP-first metadata + manifest, Playwright unlocks price (proven by HTML probe, not assumed).
+- Manifest-driven selectors via `buildSelectors()` + STRUCTURE_CHANGED events (fingerprint persisted per product, compared every scrape).
 - Never `price || 0`; unknown stock stays unknown; history only on validated success.
-- Concurrency 2, per-product due-check, run-level overlap lock.
+- Atomic persistence (one transaction per finished scrape, pg) — no partial state.
+- Concurrency 2, per-product due-check, atomic single-statement cron run claim.
 
 ## Bonus Features
 

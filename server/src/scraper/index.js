@@ -1,9 +1,12 @@
 'use strict';
 
-// scrapeTrackedProduct(trackedProductId, { headed, forcePlaywright })
-// Pipeline: HTTP metadata -> validate -> Playwright price unlock -> validate.
-// Every attempt is persisted to scrape_attempts by the caller (scrape.service);
-// ONLY validated successes produce price_history rows (see services/scrape.js).
+// scrapeTrackedProduct(tracked, { headed, io })
+// Pipeline: HTTP-first metadata acquisition + manifest lookup, then Playwright
+// for the browser-gated price/stock extraction, then validation.
+// Every attempt is returned so the caller (scrape.service) can persist them
+// honestly; ONLY validated successes produce price_history rows.
+// `io` allows tests to inject stubs { fetchItemFn, fetchManifestFn, scrapeFn }
+// without touching the real retry/validation logic under test.
 
 const { env } = require('../config/env');
 const { fetchItem, fetchManifest, probeProductPageHtml } = require('./http-scraper');
@@ -18,7 +21,8 @@ function logLine(fields) {
   logger.info('[SCRAPE] ' + Object.entries(fields).map(([k, v]) => `${k}=${v}`).join(' '));
 }
 
-async function scrapeTrackedProduct(tracked, { headed = false, forcePlaywright = false, db = null } = {}) {
+async function scrapeTrackedProduct(tracked, { headed = false, db = null, io = {} } = {}) {
+  const { fetchItemFn = fetchItem, fetchManifestFn = fetchManifest, scrapeFn = scrapeWithPlaywright } = io;
   const maxAttempts = env.MAX_SCRAPE_ATTEMPTS;
   const attempts = []; // returned so service can persist every attempt honestly
   const storeProductId = tracked.product.storeProductId;
@@ -26,7 +30,7 @@ async function scrapeTrackedProduct(tracked, { headed = false, forcePlaywright =
   const sourceUrl = `${env.STORE_BASE_URL}/item/${encodeURIComponent(storeProductId)}`;
 
   // Pre-flight over HTTP: confirm product + option still exist (cheap, no browser).
-  const meta = await fetchItem(storeProductId);
+  const meta = await fetchItemFn(storeProductId);
   if (!meta.ok && !isRetryable(meta.code)) {
     const a = toAttempt(tracked, 1, 'http', meta, null);
     attempts.push(a);
@@ -47,7 +51,7 @@ async function scrapeTrackedProduct(tracked, { headed = false, forcePlaywright =
   let manifestFp = null;
   let manifest = null;
   try {
-    const mf = await fetchManifest();
+    const mf = await fetchManifestFn();
     if (mf.ok) { manifest = mf.manifest; manifestFp = fingerprintManifest(mf.manifest); }
   } catch { /* ignore */ }
 
@@ -57,13 +61,13 @@ async function scrapeTrackedProduct(tracked, { headed = false, forcePlaywright =
   }).catch(() => {});
 
   let lastError = { code: 'UNKNOWN', message: 'Scrape failed.' };
-  const totalAttempts = forcePlaywright ? maxAttempts : maxAttempts;
+  const totalAttempts = maxAttempts;
   for (let n = 1; n <= totalAttempts; n++) {
     const startedAt = new Date().toISOString();
     const t0 = Date.now();
     logLine({ product: storeProductId, option: optionLabel, attempt: n, strategy: 'playwright', status: 'started' });
     try {
-      const r = await scrapeWithPlaywright({ storeProductId, optionLabel, sourceUrl, headed, manifest });
+      const r = await scrapeFn({ storeProductId, optionLabel, sourceUrl, headed, manifest });
       const v = validateScraped(r.data);
       if (!v.ok) throw Object.assign(new Error(v.message), { code: v.code });
       const attempt = { trackedProductId: tracked.id, attemptNumber: n, status: 'success', strategy: 'playwright', startedAt, completedAt: new Date().toISOString(), durationMs: Date.now() - t0, price: r.data.price, stock: r.data.stock, httpStatus: null, errorCode: null, errorMessage: null };

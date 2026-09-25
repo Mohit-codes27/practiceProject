@@ -1,30 +1,49 @@
 'use strict';
 
-// Scrape service: runs scrapeTrackedProduct, persists attempts + (only on
-// validated success) price_history, updates tracking metadata, emits bonus
-// events (PRICE_DROP / BACK_IN_STOCK / STRUCTURE_CHANGED).
+// Scrape service: runs scrapeTrackedProduct, then persists the whole outcome
+// ATOMICALLY via db.saveScrapeOutcome (attempts + optional history + tracking
+// touch + events commit together or roll back together — never partial state).
+// ONLY validated successes produce price_history rows.
+// Bonus events: PRICE_DROP, BACK_IN_STOCK, STRUCTURE_CHANGED.
 
 const { scrapeTrackedProduct } = require('../scraper/index');
 const { pool } = require('../utils/concurrency');
 const { env } = require('../config/env');
 
-async function runSingle(trackedId, db, { headed = false } = {}) {
+async function runSingle(trackedId, db, { headed = false, io = {} } = {}) {
   const tracked = await db.getTracked(trackedId);
   if (!tracked) throw Object.assign(new Error('Tracked product not found.'), { status: 404, code: 'TRACKED_NOT_FOUND' });
 
   const prevLatest = await db.latestHistory(trackedId).catch(() => null);
-  const result = await scrapeTrackedProduct(tracked, { headed, db });
+  const prevFp = await db.getStructureFingerprint(trackedId).catch(() => null);
+  const result = await scrapeTrackedProduct(tracked, { headed, db, io });
 
-  for (const a of result.attempts) await db.insertAttempt(a);
-
+  const events = [];
   if (result.ok) {
-    const scrapedAt = new Date().toISOString();
-    await db.insertHistory({ trackedProductId: trackedId, price: result.data.price, stock: result.data.stock, scrapedAt });
-    await db.touchTracked(trackedId, { success: true });
-    await maybeEmitEvents(db, trackedId, prevLatest, result.data);
+    events.push(...buildBonusEvents(prevLatest, result.data));
+    // STRUCTURE_CHANGED: manifest fingerprint differs from the last stored
+    // one. Logged as an event — validation (not the fingerprint) decides
+    // whether extraction still works, so this never fails a scrape.
+    if (result.manifestFp) {
+      if (prevFp && prevFp !== result.manifestFp) {
+        events.push({
+          eventType: 'STRUCTURE_CHANGED',
+          message: `Store layout fingerprint changed (${prevFp} -> ${result.manifestFp}). Extraction still validated.`,
+          metadata: { previous: prevFp, current: result.manifestFp },
+        });
+      }
+      await db.setStructureFingerprint(trackedId, result.manifestFp).catch(() => {});
+    }
+    await db.saveScrapeOutcome({
+      trackedId,
+      attempts: result.attempts,
+      history: { trackedProductId: trackedId, price: result.data.price, stock: result.data.stock, scrapedAt: new Date().toISOString() },
+      success: true,
+      events,
+    });
     return { success: true, data: result.data, attempts: result.attempts.length };
   }
-  await db.touchTracked(trackedId, { success: false });
+  await db.saveScrapeOutcome({ trackedId, attempts: result.attempts, history: null, success: false, events: [] });
   return { success: false, errorCode: result.errorCode, errorMessage: result.errorMessage, attempts: result.attempts.length };
 }
 
@@ -44,18 +63,26 @@ function isDue(t) {
   return mins >= (t.scrapeIntervalMinutes || 120) - 1;
 }
 
-async function maybeEmitEvents(db, trackedId, prevLatest, data) {
-  try {
-    if (prevLatest) {
-      if (Number(data.price) < Number(prevLatest.price ?? prevLatest.price)) {
-        await db.insertEvent({ trackedProductId: trackedId, eventType: 'PRICE_DROP', message: `Price dropped from ${prevLatest.price} to ${data.price}.`, metadata: { from: Number(prevLatest.price), to: Number(data.price) } });
-      }
-      const prevStock = prevLatest.stock === true || prevLatest.stock === 'true' || prevLatest.stock === 1;
-      if (!prevStock && data.stock === true) {
-        await db.insertEvent({ trackedProductId: trackedId, eventType: 'BACK_IN_STOCK', message: `${data.productName} (${data.optionValue}) is back in stock.`, metadata: {} });
-      }
-    }
-  } catch { /* events are best-effort */ }
+// Pure helper: bonus events derived from previous vs current validated data.
+function buildBonusEvents(prevLatest, data) {
+  const events = [];
+  if (!prevLatest) return events;
+  if (Number(data.price) < Number(prevLatest.price)) {
+    events.push({
+      eventType: 'PRICE_DROP',
+      message: `Price dropped from ${prevLatest.price} to ${data.price}.`,
+      metadata: { from: Number(prevLatest.price), to: Number(data.price) },
+    });
+  }
+  const prevStock = prevLatest.stock === true || prevLatest.stock === 'true' || prevLatest.stock === 1;
+  if (!prevStock && data.stock === true) {
+    events.push({
+      eventType: 'BACK_IN_STOCK',
+      message: `${data.productName} (${data.optionValue}) is back in stock.`,
+      metadata: {},
+    });
+  }
+  return events;
 }
 
-module.exports = { runSingle, runAll };
+module.exports = { runSingle, runAll, buildBonusEvents };
